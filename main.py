@@ -4,39 +4,30 @@ import random
 import re
 import time
 import json
-import requests
-from concurrent.futures import ThreadPoolExecutor
+import urllib3
+import math
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Union, List, Tuple
 
 
+CONNS = {}
 
-def __calculate_row_count(num_columns:int, size_str:(str or int))->(list, int):
+def __calculate_row_count(num_columns: int, size_str: Union[str, int]) -> Tuple[List[str], int]:
     """
-    Generate column names and generate row count based on number of columns if byte based
-    :args:
-        num_columns:int - number of column
-        size_str:(str or int) - number of row (int) or quantity of data (str)
-    :params:
-        match - re match checker
-        size_calc:dict - power params
-        row_size_bytes:int - Estimated row size
-        total_bytes:int - calculate bytes
-        column_names:list - list of columns
-        size_num, size_str - calculate the quantity of data
-        total_bytes:float - size_str in bytes
 
+    :param num_columns:
+    :param size_str:
     :return:
-        column names and number of rows
     """
     column_names = [f'column_{i + 1}' for i in range(num_columns)]
 
-    # If it's already a row count (int or numeric string)
     if isinstance(size_str, int) or (isinstance(size_str, str) and size_str.isdigit()):
         return column_names, int(size_str)
 
-    # Try to parse size string like "10MB", "1.5GB", etc.
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]+)", size_str.strip())
     if not match:
-        raise ValueError("Invalid size string format. Use digits, or suffix with B/MB/GB/TB.")
+        raise ValueError("Invalid size format. Use digits or suffix with B/KB/MB/GB/TB.")
 
     size_num = float(match.group(1))
     size_unit = match.group(2).upper()
@@ -52,7 +43,6 @@ def __calculate_row_count(num_columns:int, size_str:(str or int))->(list, int):
     if size_unit not in size_multiplier:
         raise ValueError(f"Unsupported unit: {size_unit}. Use B, KB, MB, GB, or TB.")
 
-    # Estimate row size in bytes: each numeric column = 8 bytes, timestamp = 8 bytes
     row_size_bytes = num_columns * 8 + 8
     total_bytes = size_num * size_multiplier[size_unit]
 
@@ -65,7 +55,9 @@ def generate_row(columns: list) -> dict:
         **{column: round(random.random() * random.randint(1, 999), random.randint(0, 2)) for column in columns}
     }
 
-def insert_data(conns:list, dbms:str, table:str, payload:list):
+
+def insert_data(dbms: str, table: str, payload: list):
+    global CONNS
     headers = {
         'type': 'json',
         'dbms': dbms,
@@ -73,55 +65,85 @@ def insert_data(conns:list, dbms:str, table:str, payload:list):
         'mode': 'streaming',
         'Content-Type': 'text/plain'
     }
-    conn = random.choice(conns)
+    conn = None
+    while conn is None:
+        conn = random.choice(list(CONNS.keys()))
+        if CONNS[conn] is False:
+            CONNS[conn] = True
+        else:
+            conn = None
     try:
-        response = requests.put(url=f'http:{conn}', headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
+        response = urllib3.request(method='PUT', url=f'http://{conn}', headers=headers, body=json.dumps(payload))
     except Exception as error:
-        raise Exception(f'Failed to execute PUT against {conn} (Error: {error})')
+        raise Exception(f'❌ Failed insert to {conn}: {error}')
+    else:
+        if 200 <= response.status < 300:
+            CONNS[conn] = False
+        else:
+            raise urllib3.exceptions.ConnectionError(response.status)
+
 
 def main():
+    global CONNS
     parser = argparse.ArgumentParser()
     parser.add_argument('--conn', required=True, type=str, help='Comma-separated operator or publisher connections')
-    # parser.add_argument('--query-node', required=False, type=str, help='Query node IP:Port')
     parser.add_argument('--num-columns', type=int, default=1, help='Number of columns')
-    parser.add_argument('--batch-size', type=int, default=10, help='Rows per insert')
-    parser.add_argument('--size', type=str, default="10MB", help='Target table size (e.g. 10MB, 1GB)')
-    parser.add_argument('--hz', type=int, default=0, help='inserts per second (if 0 then ignored)')
-    parser.add_argument('--threads', type=int, default=5, help='Number of threads to use')
-    parser.add_argument('--dbms', type=str, default='test', help='database name')
-    parser.add_argument('--table', type=str, default='rand_data', help='table name')
-
+    parser.add_argument('--batch-size', type=int, default=10, help='Rows per insert (0 = auto)')
+    parser.add_argument('--size', type=str, default="10MB", help='Target table size (e.g. 10MB, 1GB) (0 = ignore)')
+    parser.add_argument('--hz', type=int, default=0, help='Inserts per second (0 = no rate limit)')
+    parser.add_argument('--threads', type=int, default=1, help='Number of threads to run in parallel')
+    parser.add_argument('--run-time', type=float, default=0, help='Run for X seconds (0 = ignore)')
+    parser.add_argument('--dbms', type=str, default='test', help='Database name')
+    parser.add_argument('--table', type=str, default='rand_data', help='Table name')
     args = parser.parse_args()
 
-    columns, row_count = __calculate_row_count(num_columns=args.num_columns, size_str=args.size)
-    sleep_time = (args.batch_size / args.hz) if args.hz > 0 else 0
-    print(f"🎯 Target row count: {row_count:,} rows | Columns: {len(columns)}")
+    for conn in args.conn.split(','):
+        CONNS[conn] = False
 
-    total_rows = 0
-    t0 = time.time()
-    while total_rows < row_count:
-        rows = []
-        start_time = time.time()
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            rows.append(generate_row(columns=columns))
-            if len(rows) % args.batch_size == 0:
-                # 🔄 Simulate batch insert (replace with PUT request)
-                insert_data(conns=args.conn.split(','), dbms=args.dbms, table=args.table, payload=rows)
-                print(f"📤 Inserted batch of {len(rows)} rows...")
-                total_rows += len(rows)
-                rows = []
-                elapsed_time = time.time() - start_time
-                if sleep_time > elapsed_time:
-                    time.sleep(sleep_time - elapsed_time)
+    columns, total_rows = (
+        __calculate_row_count(args.num_columns, args.size)
+        if args.size != "0"
+        else ([f'column_{i+1}' for i in range(args.num_columns)], float('inf'))
+    )
 
-    # Insert remaining rows
-    if rows:
-        print(f"📤 Inserted final batch of {len(rows)} rows.")
-        total_rows += len(rows)
+    args.batch_size = math.ceil(total_rows / args.threads) if args.batch_size < 1 else args.batch_size
+    sleep_time = args.batch_size / args.hz if args.hz > 0 else 0
 
-    print(f"✅ Done. Total inserted: {total_rows:,} rows | Total Time: {round(time.time() - t0, 2)}")
+    print(f"🎯 Target row count: {total_rows if total_rows != float('inf') else '∞'} | Batch size: {args.batch_size:,} | Threads: {args.threads} | Sleep: {sleep_time:.2f}s")
 
+    start_time = time.time()
+    total_inserted = 0
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = []
+
+        while True:
+            if 0 < args.run_time <= time.time() - start_time:
+                break
+
+            if args.run_time == 0 and total_inserted >= total_rows:
+                break
+
+            batch_size = min(args.batch_size, total_rows - total_inserted) if total_rows != float('inf') else args.batch_size
+            batch = [generate_row(columns) for _ in range(batch_size)]
+
+            # Submit insert job to executor
+            future = executor.submit(insert_data, args.dbms, args.table, batch)
+            futures.append(future)
+            total_inserted += batch_size
+
+            if sleep_time:
+                time.sleep(sleep_time)
+
+        # Wait for all tasks to complete
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"❌ Thread error: {e}")
+
+    elapsed = round(time.time() - start_time, 2)
+    print(f"✅ Done. Inserted {total_inserted:,} rows in {elapsed} seconds")
 
 if __name__ == "__main__":
     main()
