@@ -4,7 +4,9 @@
         intervals = 10 and
         time = 1 minute and
         time_column = timestamp and
-        value_column = column_1>
+        value_column = column_10>
+
+
 
 <set aggregations  where
     dbms = nov and
