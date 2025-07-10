@@ -1,5 +1,4 @@
 import argparse
-
 import requests
 
 def build_command(db_name:str, table_name:str, interval:int, time_frame:str, time_column:str, value_column:str):
@@ -35,7 +34,7 @@ def main():
 
     for i in range(args.num_columns):
         column_name = f'column_{i+1}' if args.column_as_table is False else 'value'
-        table_name = f'{args.table}_column_{i+1}' if args.column_as_table is True else args.table_name
+        table_name = f'{args.table}_column_{i+1}' if args.column_as_table is True else args.table
         command = build_command(db_name=args.dbms, table_name=table_name, interval=args.interval,
                                 time_frame=args.time_frame, time_column='timestamp', value_column=column_name)
         for conn in args.conn.split(','):

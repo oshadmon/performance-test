@@ -5,13 +5,13 @@ import re
 import time
 import json
 import urllib3
-import math
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Union, List, Tuple
-from collections   import defaultdict
+from collections import defaultdict
 
 CONNS = {}
+TOTAL_ROWS = 0
 http = urllib3.PoolManager()
 
 
@@ -23,12 +23,6 @@ def __seconds_to_hhmmss_f(seconds):
 
 
 def __calculate_row_count(num_columns: int, size_str: Union[str, int]) -> Tuple[List[str], int]:
-    """
-
-    :param num_columns:
-    :param size_str:
-    :return:
-    """
     column_names = [f'column_{i + 1}' for i in range(num_columns)]
 
     if isinstance(size_str, int) or (isinstance(size_str, str) and size_str.isdigit()):
@@ -64,8 +58,11 @@ def generate_row(columns: list) -> dict:
         **{column: round(random.random() * random.randint(1, 999), random.randint(0, 2)) for column in columns}
     }
 
-def insert_data(dbms: str, table: str, payload: (list or dict)):
+
+def insert_data(dbms: str, table: str, payload: Union[list, dict]):
     global CONNS
+    global TOTAL_ROWS
+
     headers_base = {
         'type': 'json',
         'dbms': dbms,
@@ -74,114 +71,68 @@ def insert_data(dbms: str, table: str, payload: (list or dict)):
     }
 
     def get_conn():
-        conn = None
-        while conn is None:
+        while True:
             candidate = random.choice(list(CONNS.keys()))
             if not CONNS[candidate]:
                 CONNS[candidate] = True
-                conn = candidate
-        return conn
+                return candidate
 
     def release_conn(conn):
         CONNS[conn] = False
 
-    def send_request(conn, table_name, data, retries=3):
+    def send_request(conn, table_name, data):
+        global  TOTAL_ROWS
         headers = headers_base.copy()
         headers['table'] = table_name
         url = f'http://{conn}'
-        for attempt in range(1, retries + 1):
-            try:
-                response = http.request(
-                    method='PUT',
-                    url=url,
-                    headers=headers,
-                    body=json.dumps(data)
-                )
 
-                if 500 <= response.status < 600:
-                    # print(f"⚠️ Server error (500+) on attempt {attempt} to {url}")
-                    time.sleep(2 * attempt)
-                    continue  # Retry
-                if not (200 <= response.status < 300):
-                    raise Exception(f"HTTP {response.status}: {response.data.decode('utf-8')}")
-
-                return  # Success, exit the loop
-
-            except Exception as e:
-                if attempt == retries:
-                    preview = json.dumps(data[:1], indent=2) if isinstance(data, list) else str(data)[:500]
-                    raise Exception(
-                        f"❌ Final failure inserting to {conn} (table: {table_name}) after {retries} attempts. Error: {e}\nPayload (truncated): {preview}")
-                time.sleep(2 * attempt)
-
-        raise Exception(f"❌ Unreachable: failed all {retries} attempts to {conn}")
-
-    conn = get_conn()
-    try:
-        if isinstance(payload, dict):
-            for tbl, rows in payload.items():
-                send_request(conn, tbl, rows)
-        else:
-            send_request(conn, table, payload)
-    finally:
-        release_conn(conn)
-
-    if isinstance(payload, dict):
-        # Send all tables in parallel, each on its own connection
-        with ThreadPoolExecutor(max_workers=len(payload)) as executor:
-            futures = []
-            for tbl, data in payload.items():
-                conn = get_conn()
-                futures.append(executor.submit(send_request, conn, tbl, data))
-            for future in as_completed(futures):
-                # Will raise exceptions here if any request failed
-                future.result()
-    else:
-        # Single payload, single connection
-        conn = get_conn()
-        headers = headers_base.copy()
-        headers['table'] = table
         try:
             response = http.request(
                 method='PUT',
-                url=f'http://{conn}',
+                url=url,
                 headers=headers,
-                body=json.dumps(payload)
+                body=json.dumps(data)
             )
-            if not (200 <= response.status < 300):
-                raise urllib3.exceptions.ConnectionError(f"Status: {response.status}")
+
+            if 200 <= response.status < 300:
+                TOTAL_ROWS += len(data) if isinstance(data, list) else 1
+
         except Exception as e:
-            raise Exception(f"❌ Failed insert to {conn}: {e}")
+            pass
+            # print(f"❌ Failed attempt {attempt} to insert into {table_name} at {conn}: {e}")
+            # time.sleep(min(10, 2 * attempt))
+            # attempt += 1
+
+        # If we exit loop, all retries failed
+        # raise Exception(f"Max retries exceeded for table {table_name} on {conn}")
+
+    if isinstance(payload, dict):
+        with ThreadPoolExecutor(max_workers=len(payload)) as executor:
+            futures = []
+            for tbl, rows in payload.items():
+                conn = get_conn()
+                future = executor.submit(send_request, conn, tbl, rows)
+                futures.append((future, conn, tbl))
+            for future, conn, tbl in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"❌ Insert failed for table {tbl} on {conn}: {e}")
+                finally:
+                    release_conn(conn)
+    else:
+        conn = get_conn()
+        try:
+            send_request(conn, table, payload)
+        except Exception as e:
+            print(f"❌ Insert failed for table {table} on {conn}: {e}")
         finally:
             release_conn(conn)
 
 
 def main():
-    """
-    The following is a tool to insert data (via PUT) in order to test performance for AnyLog/EdgeLake
-
-    The application allows for insertion to run either based on time interval or quantity of data.
-
-    Users may also choose the number of columns (not including timestamp) and whether to store the columns in a single table
-    or each column in its own table.
-    :positional arguments:
-        conn                  Comma-separated operator or publisher connections
-    :options:
-        -h, --help                              show this help message and exit
-        --num-columns       NUM_COLUMNS         Number of columns (default: 1)
-        --batch-size        BATCH_SIZE          Rows per insert (0 = auto) (default: 10)
-        --size              SIZE                Target table size (e.g. 10MB, 1GB) (0 = ignore) (default: 10MB)
-        --hz                HZ                  Inserts per column per second (0 = no rate limit) (default: 0)
-        --max-threads       MAX_THREADS         Max number of threads to run in parallel (0 = ignore) (default: 0)
-        --run-time          RUN_TIME            Run for X seconds (0 = ignore) (default: 0)
-        --dbms              DBMS                Database name (default: test)
-        --table             TABLE               Table name (default: rand_data)
-        --column-as-table   [COLUMN_AS_TABLE]   convert columns into timestamp/value tables (default: False)
-    :global:
-        CONNs:dict - Connectors to AnyLog nodes.
-    :return:
-    """
     global CONNS
+    global TOTAL_ROWS
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('conn', type=str, help='Comma-separated operator or publisher connections')
     parser.add_argument('--num-columns', type=int, default=1, help='Number of columns')
@@ -199,26 +150,20 @@ def main():
         if conn not in CONNS:
             CONNS[conn] = False
 
-    threads = args.max_threads if len(list(CONNS.keys())) > args.max_threads > 0 else len(list(CONNS.keys()))
+    threads = args.max_threads if len(CONNS) > args.max_threads > 0 else len(CONNS)
 
     columns, total_rows = (
         __calculate_row_count(args.num_columns, args.size)
         if args.size != "0"
-        else ([f'column_{i+1}' for i in range(args.num_columns)], float('inf'))
+        else ([f'column_{i + 1}' for i in range(args.num_columns)], float('inf'))
     )
-
-    # args.batch_size = 1000 if args.batch_size < 1 else args.batch_size
-    # if args.hz > 0:
-    #     args.batch_size = math.ceil(args.hz * args.num_columns)
-    # elif args.batch_size < 1:
-    #     args.batch_size = math.ceil(total_rows / threads)
-    #
 
     output = f"🎯 Target - Batch size: {args.batch_size:,} | Number of Columns: {args.num_columns:,} | Number of Threads: {threads}"
     if args.run_time > 0:
         output += f" | Expected Run Time: {__seconds_to_hhmmss_f(args.run_time)}"
     elif args.size:
         output += f" | Expected Size: {args.size} | Expected Row Count: {total_rows:,}"
+    output += f" | Convert Columns to Tables: {str(args.column_as_table).capitalize()}"
     print(output)
 
     start_time = time.time()
@@ -234,7 +179,8 @@ def main():
 
             batch_size = min(args.batch_size, total_rows - total_inserted) if total_rows != float('inf') else args.batch_size
             batch = [generate_row(columns) for _ in range(batch_size)]
-            if args.column_as_table is True:
+
+            if args.column_as_table:
                 data = defaultdict(list)
                 for row in batch:
                     timestamp = row['timestamp']
@@ -243,28 +189,23 @@ def main():
                             continue
                         data[f"{args.table}_{key}"].append({'timestamp': timestamp, 'value': value})
                 future = executor.submit(insert_data, args.dbms, args.table, data)
-                futures.append(future)
-                total_inserted += batch_size
             else:
                 future = executor.submit(insert_data, args.dbms, args.table, batch)
-                futures.append(future)
-                total_inserted += batch_size
-            # print(f"{total_inserted:,}")
 
-            # Wait for all tasks to complete
+            futures.append(future)
+            total_inserted += batch_size
+
             for future in as_completed(futures):
-                future.result()
-                # try:
-                #     future.result()
-                # except Exception as e:
-                #     print(f"❌ Thread error: {e}")
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"❌ Thread insert failed: {e}")
 
             if args.hz > 0 and (time.time() - iteration_start) < 1:
-                time.sleep(1-(time.time() - iteration_start))
+                time.sleep(1 - (time.time() - iteration_start))
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"✅ Done. Inserted {total_inserted:,} rows in {elapsed} seconds")
-
+    print(f"✅ Done. Inserted {TOTAL_ROWS:,} rows in {elapsed} seconds")
 
 
 if __name__ == "__main__":
