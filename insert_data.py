@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Union, List, Tuple
 from collections import defaultdict
 
-CONNS = {}
+CONNS = []
 TOTAL_ROWS = 0
 http = urllib3.PoolManager()
 
@@ -71,11 +71,8 @@ def insert_data(dbms: str, table: str, payload: Union[list, dict]):
     }
 
     def get_conn():
-        while True:
-            candidate = random.choice(list(CONNS.keys()))
-            if not CONNS[candidate]:
-                CONNS[candidate] = True
-                return candidate
+        candidate = random.choice(CONNS)
+        return candidate
 
     def release_conn(conn):
         CONNS[conn] = False
@@ -130,6 +127,7 @@ def insert_data(dbms: str, table: str, payload: Union[list, dict]):
             release_conn(conn)
 
 
+
 def main():
     global CONNS
     global TOTAL_ROWS
@@ -148,9 +146,12 @@ def main():
 
     for conn in args.conn.split(','):
         if conn not in CONNS:
-            CONNS[conn] = False
+            CONNS.append(conn)
 
-    threads = args.max_threads if len(CONNS) > args.max_threads > 0 else len(CONNS)
+    if args.column_as_table is True and ((args.num_columns <= 10 and args.max_threads <= 1) or args.max_threads == 0):
+        threads = args.num_columns
+    else:
+        threads = args.max_threads if len(CONNS) > args.max_threads > 0 else len(CONNS)
 
     columns, total_rows = (
         __calculate_row_count(args.num_columns, args.size)
@@ -198,6 +199,8 @@ def main():
             for future in as_completed(futures):
                 try:
                     future.result()
+                except TypeError:
+                    pass
                 except Exception as e:
                     print(f"❌ Thread insert failed: {e}")
 
@@ -205,7 +208,7 @@ def main():
                 time.sleep(1 - (time.time() - iteration_start))
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"✅ Done. Inserted {TOTAL_ROWS:,} rows in {elapsed} seconds")
+    print(f"✅ Done. Inserted {TOTAL_ROWS:,} rows in {__seconds_to_hhmmss_f(elapsed)}")
 
 
 if __name__ == "__main__":
