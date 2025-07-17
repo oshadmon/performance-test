@@ -98,18 +98,24 @@ def insert_data(dbms: str, table: str, payload: list):
 
 def worker(stop_time: float, total_rows: int, rps: float, columns: List[str], dbms: str, table: str):
     interval = 1.0  # seconds
-    rows_per_interval = int(rps * interval)
 
     while time.time() < stop_time and TOTAL_ROWS < total_rows:
         start = time.time()
 
-        batch = [generate_row(columns) for _ in range(rows_per_interval)]
+        if rps == float('inf'):
+            # Unlimited mode: just send a fixed-size large batch repeatedly
+            batch_size = 1000
+        else:
+            batch_size = int(rps * interval)
+
+        batch = [generate_row(columns) for _ in range(batch_size)]
         insert_data(dbms, table, batch)
 
         elapsed = time.time() - start
         sleep_time = interval - elapsed
-        if sleep_time > 0:
+        if rps != float('inf') and sleep_time > 0:
             time.sleep(sleep_time)
+
 
 
 def main():
@@ -128,7 +134,7 @@ def main():
     args = parser.parse_args()
 
     CONNS = args.conn.split(',')
-    threads = min(32, len(CONNS) * 2)
+    threads = min(args.max_threads, len(CONNS) * 2) if args.max_threads < 8 else max(args.max_threads, len(CONNS) * 2)
     columns, total_rows = (
         calculate_row_count(args.num_columns, args.size)
         if args.run_time == 0 else ([f'column_{i + 1}' for i in range(args.num_columns)], float('inf'))
@@ -158,6 +164,7 @@ def main():
                 print(f"❌ Thread error: {e}")
 
     elapsed = round(time.time() - start_time, 2)
+
     print(f"\n✅ Done. Inserted {TOTAL_ROWS:,} rows in {seconds_to_hhmmss(elapsed)}")
     print(f"⚡ Throughput: {int(TOTAL_ROWS / elapsed):,} rows/sec\n")
 
